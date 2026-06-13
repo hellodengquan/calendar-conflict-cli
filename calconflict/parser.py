@@ -94,6 +94,7 @@ def _load_csv(path: Path) -> List[Event]:
 
 
 _MULTI_VALUE_KEYS = {"ATTENDEE"}
+_LIST_VALUE_KEYS = {"EXDATE"}
 
 
 def _unfold_ics_lines(text: str) -> List[str]:
@@ -165,75 +166,128 @@ def _load_ics(path: Path) -> List[Event]:
 
         if key in _MULTI_VALUE_KEYS:
             current.setdefault(key, []).append((params, value))
+        elif key in _LIST_VALUE_KEYS:
+            current.setdefault(key, []).append((params, value))
         else:
             current[key] = (params, value)
 
     events: List[Event] = []
     for idx, raw in enumerate(events_raw):
-        dtstart_item = raw.get("DTSTART")
-        dtend_item = raw.get("DTEND")
-        if not dtstart_item or not dtend_item:
+        base_ev = _parse_single_vevent(raw, idx, calendar_tz, tz_cache)
+        if base_ev is None:
             continue
 
-        start_params, start_val = dtstart_item
-        end_params, end_val = dtend_item
-
-        start_is_date = start_params.get("VALUE") == "DATE"
-        end_is_date = end_params.get("VALUE") == "DATE"
-
-        start_tzid = start_params.get("TZID")
-        end_tzid = end_params.get("TZID")
-
-        if start_is_date and end_is_date:
-            start_dt = _parse_ics_date(start_val)
-            end_dt = _parse_ics_date(end_val)
-            if end_dt == start_dt:
-                end_dt = start_dt + timedelta(days=1)
-            events.append(
-                Event(
-                    title=raw.get("SUMMARY", ("", f"Event {idx + 1}"))[1],
-                    start=start_dt,
-                    end=end_dt,
-                    location=raw.get("LOCATION", (None, None))[1] or None,
-                    attendees=_parse_ics_attendees(raw),
-                    id=raw.get("UID", ("", str(idx)))[1],
+        rrule_item = raw.get("RRULE")
+        if rrule_item:
+            rrule_val = rrule_item[1] if isinstance(rrule_item, tuple) else rrule_item
+            try:
+                from .rrule import RRule, expand_rrule
+                rule = RRule.parse(rrule_val)
+                exdates = _collect_exdates(
+                    raw, base_ev.start.tzinfo, calendar_tz, tz_cache
                 )
-            )
-            continue
+                expanded = expand_rrule(base_ev, rule, exdates)
+                events.extend(expanded)
+                continue
+            except Exception:
+                events.append(base_ev)
+        else:
+            events.append(base_ev)
 
-        start_dt = _parse_ics_datetime_tz(
-            start_val, start_tzid, calendar_tz, tz_cache
-        )
-        end_dt = _parse_ics_datetime_tz(
-            end_val, end_tzid, calendar_tz, tz_cache
-        )
-
-        summary_val = raw.get("SUMMARY")
-        title = summary_val[1] if isinstance(summary_val, tuple) else (
-            summary_val if summary_val else f"Event {idx + 1}"
-        )
-        loc_val = raw.get("LOCATION")
-        location = None
-        if isinstance(loc_val, tuple):
-            location = loc_val[1] or None
-        elif loc_val:
-            location = loc_val
-        uid_val = raw.get("UID")
-        eid = uid_val[1] if isinstance(uid_val, tuple) else (
-            uid_val if uid_val else str(idx)
-        )
-
-        events.append(
-            Event(
-                title=title,
-                start=start_dt,
-                end=end_dt,
-                location=location,
-                attendees=_parse_ics_attendees(raw),
-                id=eid,
-            )
-        )
     return events
+
+
+def _parse_single_vevent(
+    raw: dict,
+    idx: int,
+    calendar_tz: Optional[timezone],
+    tz_cache: Dict[str, timezone],
+) -> Optional[Event]:
+    dtstart_item = raw.get("DTSTART")
+    dtend_item = raw.get("DTEND")
+    if not dtstart_item or not dtend_item:
+        return None
+
+    start_params, start_val = dtstart_item
+    end_params, end_val = dtend_item
+
+    start_is_date = start_params.get("VALUE") == "DATE"
+    end_is_date = end_params.get("VALUE") == "DATE"
+
+    start_tzid = start_params.get("TZID")
+    end_tzid = end_params.get("TZID")
+
+    if start_is_date and end_is_date:
+        start_dt = _parse_ics_date(start_val)
+        end_dt = _parse_ics_date(end_val)
+        if end_dt == start_dt:
+            end_dt = start_dt + timedelta(days=1)
+        return Event(
+            title=_get_ics_str(raw, "SUMMARY", f"Event {idx + 1}"),
+            start=start_dt,
+            end=end_dt,
+            location=_get_ics_str_opt(raw, "LOCATION"),
+            attendees=_parse_ics_attendees(raw),
+            id=_get_ics_str(raw, "UID", str(idx)),
+        )
+
+    start_dt = _parse_ics_datetime_tz(
+        start_val, start_tzid, calendar_tz, tz_cache
+    )
+    end_dt = _parse_ics_datetime_tz(
+        end_val, end_tzid, calendar_tz, tz_cache
+    )
+
+    return Event(
+        title=_get_ics_str(raw, "SUMMARY", f"Event {idx + 1}"),
+        start=start_dt,
+        end=end_dt,
+        location=_get_ics_str_opt(raw, "LOCATION"),
+        attendees=_parse_ics_attendees(raw),
+        id=_get_ics_str(raw, "UID", str(idx)),
+    )
+
+
+def _get_ics_str(raw: dict, key: str, default: str) -> str:
+    val = raw.get(key)
+    if isinstance(val, tuple):
+        return val[1] or default
+    return val if val else default
+
+
+def _get_ics_str_opt(raw: dict, key: str) -> Optional[str]:
+    val = raw.get(key)
+    if isinstance(val, tuple):
+        result = val[1]
+        return result if result else None
+    return val if val else None
+
+
+def _collect_exdates(
+    raw: dict,
+    event_tz,
+    calendar_tz: Optional[timezone],
+    tz_cache: Dict[str, timezone],
+) -> List[datetime]:
+    result: List[datetime] = []
+    items = raw.get("EXDATE")
+    if not items:
+        return result
+    if not isinstance(items, list):
+        items = [items]
+    for params, value in items:
+        tzid = params.get("TZID")
+        is_date = params.get("VALUE") == "DATE"
+        for v in value.split(","):
+            v = v.strip()
+            if not v:
+                continue
+            if is_date:
+                dt = _parse_ics_date(v)
+            else:
+                dt = _parse_ics_datetime_tz(v, tzid, calendar_tz, tz_cache)
+            result.append(dt)
+    return result
 
 
 def _resolve_tz(tz_name: str, cache: Dict[str, timezone]) -> Optional[timezone]:

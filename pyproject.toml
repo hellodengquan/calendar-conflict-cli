@@ -9,6 +9,11 @@ dependencies = [
     "python-dateutil>=2.8.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 calconflict = "calconflict.cli:app"
 
@@ -18,3 +23,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["calconflict*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
