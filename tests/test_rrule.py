@@ -5,7 +5,7 @@ from dateutil import tz
 
 from calconflict.models import Event
 from calconflict.parser import load_events
-from calconflict.rrule import RRule, expand_rrule
+from calconflict.rrule import RRule, RRuleHorizonError, expand_rrule
 
 
 class TestRRuleParsing:
@@ -286,3 +286,221 @@ class TestIcsWithRRule:
         conflicts = detect_conflicts(events)
         assert len(conflicts) == 1
         assert conflicts[0].duration == timedelta(minutes=30)
+
+
+class TestMonthlyBymonthday:
+    def test_start_day_before_target(self):
+        start = datetime(2026, 6, 5, 16, 0)
+        r = RRule.parse("FREQ=MONTHLY;BYMONTHDAY=15;COUNT=4")
+        dates = r.iter_dates(start)
+        assert len(dates) == 4
+        for d in dates:
+            assert d.day == 15
+        assert dates[0].month == 6
+        assert dates[-1].month == 9
+
+    def test_start_day_after_target(self):
+        start = datetime(2026, 6, 20, 16, 0)
+        r = RRule.parse("FREQ=MONTHLY;BYMONTHDAY=15;COUNT=4")
+        dates = r.iter_dates(start)
+        assert len(dates) == 4
+        assert dates[0].month == 7
+        assert dates[-1].month == 10
+
+    def test_bymonthday_multiple_days(self):
+        start = datetime(2026, 6, 10, 9, 0)
+        r = RRule.parse("FREQ=MONTHLY;BYMONTHDAY=1,15,-1;COUNT=6")
+        dates = r.iter_dates(start)
+        assert len(dates) == 6
+        days = [d.day for d in dates]
+        assert 15 in days
+        assert 30 in days
+        assert 1 in days
+
+    def test_bymonthday_last_day_of_month(self):
+        start = datetime(2026, 1, 15, 9, 0)
+        r = RRule.parse("FREQ=MONTHLY;BYMONTHDAY=-1;COUNT=4")
+        dates = r.iter_dates(start)
+        assert len(dates) == 4
+        assert dates[0].day == 31
+        assert dates[1].day == 28
+        assert dates[2].day == 31
+
+
+class TestIntervalEdgeCases:
+    def test_weekly_interval_3_byday_single(self):
+        start = datetime(2026, 6, 15, 9, 0)
+        r = RRule.parse("FREQ=WEEKLY;BYDAY=MO;INTERVAL=3;COUNT=4")
+        dates = r.iter_dates(start)
+        assert len(dates) == 4
+        assert dates[1] - dates[0] == timedelta(weeks=3)
+        assert dates[2] - dates[1] == timedelta(weeks=3)
+
+    def test_daily_interval_5(self):
+        start = datetime(2026, 6, 15, 9, 0)
+        r = RRule.parse("FREQ=DAILY;INTERVAL=5;COUNT=5")
+        dates = r.iter_dates(start)
+        assert len(dates) == 5
+        for i in range(1, 5):
+            assert (dates[i] - dates[i - 1]) == timedelta(days=5)
+
+    def test_monthly_interval_2_bymonthday(self):
+        start = datetime(2026, 6, 1, 9, 0)
+        r = RRule.parse("FREQ=MONTHLY;BYMONTHDAY=15;INTERVAL=2;COUNT=4")
+        dates = r.iter_dates(start)
+        assert len(dates) == 4
+        assert dates[0].month == 6 and dates[0].day == 15
+        assert dates[1].month == 8
+        assert dates[2].month == 10
+        assert dates[3].month == 12
+
+
+class TestRRuleHorizon:
+    def test_no_count_no_until_truncated_by_horizon(self):
+        start = datetime(2026, 6, 15, 9, 0)
+        r = RRule.parse("FREQ=WEEKLY;BYDAY=MO")
+        horizon = datetime(2026, 8, 1, 0, 0)
+        with pytest.raises(RRuleHorizonError):
+            r.iter_dates(start, horizon=horizon)
+
+    def test_with_count_passes_horizon(self):
+        start = datetime(2026, 6, 15, 9, 0)
+        r = RRule.parse("FREQ=WEEKLY;BYDAY=MO;COUNT=4")
+        horizon = datetime(2026, 12, 31, 0, 0)
+        dates = r.iter_dates(start, horizon=horizon)
+        assert len(dates) == 4
+
+    def test_with_until_passes_horizon(self):
+        start = datetime(2026, 6, 15, 9, 0)
+        r = RRule.parse("FREQ=WEEKLY;BYDAY=MO;UNTIL=20260731T000000")
+        horizon = datetime(2026, 12, 31, 0, 0)
+        dates = r.iter_dates(start, horizon=horizon)
+        assert len(dates) >= 6
+        assert dates[-1] <= datetime(2026, 7, 31)
+
+    def test_horizon_includes_end_date(self):
+        start = datetime(2026, 6, 15, 9, 0)
+        r = RRule.parse("FREQ=DAILY")
+        horizon = datetime(2026, 6, 17, 9, 0)
+        with pytest.raises(RRuleHorizonError):
+            r.iter_dates(start, horizon=horizon)
+
+
+class TestExdateHolidays:
+    def test_exdate_multiple_dates_comma_separated(self):
+        base = Event(
+            title="Daily",
+            start=datetime(2026, 10, 1, 10, 0),
+            end=datetime(2026, 10, 1, 10, 15),
+        )
+        rule = RRule.parse("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10")
+        exdates = [
+            datetime(2026, 10, 1, 10, 0),
+            datetime(2026, 10, 2, 10, 0),
+            datetime(2026, 10, 6, 10, 0),
+            datetime(2026, 10, 7, 10, 0),
+        ]
+        expanded = expand_rrule(base, rule, exdates)
+        skipped_days = {1, 2, 6, 7}
+        for e in expanded:
+            assert e.start.day not in skipped_days
+
+    def test_exdate_with_timezone_aware(self):
+        sh = tz.gettz("Asia/Shanghai")
+        base = Event(
+            title="Standup",
+            start=datetime(2026, 10, 1, 10, 0, tzinfo=sh),
+            end=datetime(2026, 10, 1, 10, 15, tzinfo=sh),
+        )
+        rule = RRule.parse("FREQ=DAILY;COUNT=7")
+        exdates = [datetime(2026, 10, 4, 10, 0, tzinfo=sh)]
+        expanded = expand_rrule(base, rule, exdates)
+        days = {e.start.day for e in expanded}
+        assert 4 not in days
+        assert len(expanded) == 6
+
+
+class TestBymonthdayIcsIntegration:
+    def test_monthly_15th_ics(self, tmp_path):
+        ics = (
+            "BEGIN:VCALENDAR\n"
+            "X-WR-TIMEZONE:Asia/Shanghai\n"
+            "BEGIN:VEVENT\n"
+            "UID:m15\n"
+            "SUMMARY:月中报表\n"
+            "DTSTART;TZID=Asia/Shanghai:20260601T100000\n"
+            "DTEND;TZID=Asia/Shanghai:20260601T110000\n"
+            "RRULE:FREQ=MONTHLY;BYMONTHDAY=15;COUNT=6\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        f = tmp_path / "test.ics"
+        f.write_text(ics)
+        events = load_events(f)
+        assert len(events) == 6
+        for e in events:
+            assert e.start.day == 15
+
+    def test_biweekly_standup_ics(self, tmp_path):
+        ics = (
+            "BEGIN:VCALENDAR\n"
+            "X-WR-TIMEZONE:Asia/Shanghai\n"
+            "BEGIN:VEVENT\n"
+            "UID:bw1\n"
+            "SUMMARY:双周站会\n"
+            "DTSTART;TZID=Asia/Shanghai:20260617T100000\n"
+            "DTEND;TZID=Asia/Shanghai:20260617T103000\n"
+            "RRULE:FREQ=WEEKLY;BYDAY=WE;INTERVAL=2;COUNT=6\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        f = tmp_path / "test.ics"
+        f.write_text(ics)
+        events = load_events(f)
+        assert len(events) == 6
+        for i in range(1, 6):
+            delta = events[i].start - events[i - 1].start
+            assert delta == timedelta(weeks=2)
+
+    def test_ics_rrule_horizon_error(self, tmp_path):
+        from datetime import timedelta as td
+        from calconflict.parser import ParseError
+        from calconflict.rrule import RRuleHorizonError
+
+        ics = (
+            "BEGIN:VCALENDAR\n"
+            "BEGIN:VEVENT\n"
+            "UID:inf\n"
+            "SUMMARY:无限重复\n"
+            "DTSTART:20260101T090000\n"
+            "DTEND:20260101T100000\n"
+            "RRULE:FREQ=DAILY\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        f = tmp_path / "test.ics"
+        f.write_text(ics)
+        with pytest.raises(RRuleHorizonError):
+            load_events(f, rrule_horizon=td(days=30))
+
+    def test_ics_with_exdate_holidays(self, tmp_path):
+        ics = (
+            "BEGIN:VCALENDAR\n"
+            "X-WR-TIMEZONE:Asia/Shanghai\n"
+            "BEGIN:VEVENT\n"
+            "UID:standup\n"
+            "SUMMARY:每日站会\n"
+            "DTSTART;TZID=Asia/Shanghai:20260928T100000\n"
+            "DTEND;TZID=Asia/Shanghai:20260928T101500\n"
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10\n"
+            "EXDATE;TZID=Asia/Shanghai:20261001T100000,20261002T100000,20261005T100000,20261006T100000,20261007T100000\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        f = tmp_path / "test.ics"
+        f.write_text(ics)
+        events = load_events(f)
+        days = {e.start.day for e in events if e.start.month == 10}
+        for holiday in [1, 2, 5, 6, 7]:
+            assert holiday not in days
+        assert len(events) == 5

@@ -9,6 +9,12 @@ from typing import Dict, List, Optional
 from .models import Event
 
 
+class RRuleHorizonError(ValueError):
+    """RRULE 展开超出安全时间窗口时抛出。"""
+
+    pass
+
+
 _DAY_ABBR = {
     "MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6,
     "MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6,
@@ -71,7 +77,12 @@ class RRule:
 
         return rrule
 
-    def iter_dates(self, start: datetime, limit: int = 1000) -> List[datetime]:
+    def iter_dates(
+        self,
+        start: datetime,
+        limit: int = 1000,
+        horizon: Optional[datetime] = None,
+    ) -> List[datetime]:
         results: List[datetime] = []
         current = start
         added = 0
@@ -86,6 +97,13 @@ class RRule:
             if self.count is not None and added >= self.count:
                 break
             if added >= limit:
+                break
+            if horizon is not None and current > horizon:
+                if self.count is None and self.until is None:
+                    raise RRuleHorizonError(
+                        f"RRULE 展开超出安全时间窗口（{horizon.isoformat()}）。"
+                        "请为 RRULE 添加 COUNT 或 UNTIL，或增大 rrule_horizon。"
+                    )
                 break
 
             if self._matches(current, start):
@@ -157,11 +175,15 @@ class RRule:
                 return self._advance_weekly_with_byday(current)
             return current + timedelta(weeks=self.interval)
         if self.freq == "MONTHLY":
-            if self.byday or self.bymonthday:
-                return _add_months(current, self.interval)
+            if self.bymonthday:
+                return self._advance_monthly_bymonthday(current)
+            if self.byday:
+                return self._advance_monthly_byday(current)
             return _add_months_preserve_day(current, self.interval, start.day)
         if self.freq == "YEARLY":
-            if self.byday or self.bymonthday:
+            if self.bymonthday:
+                return self._advance_yearly_bymonthday(current, start)
+            if self.byday:
                 return _add_years(current, self.interval)
             return _add_years_preserve_day(current, self.interval, start.day)
         return current + timedelta(days=1)
@@ -179,6 +201,63 @@ class RRule:
         first_wd = sorted_days[0]
         days_ahead = (7 - current_wd) + first_wd + (self.interval - 1) * 7
         return current + timedelta(days=days_ahead)
+
+    def _advance_monthly_bymonthday(self, current: datetime) -> datetime:
+        if not self.bymonthday:
+            return _add_months(current, self.interval)
+
+        sorted_md = self._sorted_bymonthday(current.year, current.month)
+        for md_day in sorted_md:
+            if md_day > current.day:
+                return current.replace(day=md_day)
+
+        next_month = _add_months(
+            datetime(current.year, current.month, 1,
+                     current.hour, current.minute, current.second,
+                     tzinfo=current.tzinfo),
+            self.interval,
+        )
+        next_sorted = self._sorted_bymonthday(next_month.year, next_month.month)
+        if next_sorted:
+            return next_month.replace(day=next_sorted[0])
+        return next_month
+
+    def _advance_monthly_byday(self, current: datetime) -> datetime:
+        return _add_months(current, self.interval)
+
+    def _advance_yearly_bymonthday(self, current: datetime, start: datetime) -> datetime:
+        if not self.bymonthday:
+            return _add_years(current, self.interval)
+
+        target_month = start.month
+        if current.month < target_month or (
+            current.month == target_month and current.day < max(self.bymonthday)
+        ):
+            sorted_md = self._sorted_bymonthday(current.year, target_month)
+            for md_day in sorted_md:
+                if md_day > current.day or current.month != target_month:
+                    try:
+                        return current.replace(month=target_month, day=md_day)
+                    except ValueError:
+                        continue
+
+        next_year = current.year + self.interval
+        sorted_md = self._sorted_bymonthday(next_year, target_month)
+        if sorted_md:
+            try:
+                return current.replace(year=next_year, month=target_month, day=sorted_md[0])
+            except ValueError:
+                pass
+        return _add_years(current, self.interval)
+
+    def _sorted_bymonthday(self, year: int, month: int) -> List[int]:
+        days: List[int] = []
+        for md in self.bymonthday:
+            target = self._resolve_monthday(year, month, md)
+            if target is not None:
+                days.append(target)
+        days.sort()
+        return days
 
 
 def _parse_rrule_datetime(value: str) -> datetime:
@@ -252,8 +331,16 @@ def expand_rrule(
     rrule: RRule,
     exdates: List[datetime] = None,
     limit: int = 1000,
+    horizon: Optional[datetime] = None,
+    event_title: Optional[str] = None,
 ) -> List[Event]:
-    start_dates = rrule.iter_dates(base_event.start, limit=limit)
+    try:
+        start_dates = rrule.iter_dates(base_event.start, limit=limit, horizon=horizon)
+    except RRuleHorizonError as e:
+        title = event_title or base_event.title or "(未命名事件)"
+        raise RRuleHorizonError(
+            f"重复事件「{title}」{e}"
+        ) from e
     if exdates:
         exdates_normalized = [
             datetime(

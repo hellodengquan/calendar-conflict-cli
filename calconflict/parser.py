@@ -24,7 +24,10 @@ def _parse_datetime(value: str) -> datetime:
         raise ParseError(f"无法解析时间: {value}") from exc
 
 
-def load_events(path: str | Path) -> List[Event]:
+def load_events(
+    path: str | Path,
+    rrule_horizon: Optional[timedelta] = timedelta(days=365 * 2),
+) -> List[Event]:
     p = Path(path)
     if not p.exists():
         raise ParseError(f"文件不存在: {p}")
@@ -34,7 +37,7 @@ def load_events(path: str | Path) -> List[Event]:
     elif suffix == ".csv":
         return _load_csv(p)
     elif suffix in (".ics", ".ical"):
-        return _load_ics(p)
+        return _load_ics(p, rrule_horizon=rrule_horizon)
     raise ParseError(f"不支持的文件格式: {suffix}（支持 .json/.csv/.ics）")
 
 
@@ -138,7 +141,10 @@ def _parse_ics_line(line: str) -> Tuple[str, Dict[str, str], str]:
     return key, params, value
 
 
-def _load_ics(path: Path) -> List[Event]:
+def _load_ics(
+    path: Path,
+    rrule_horizon: Optional[timedelta] = None,
+) -> List[Event]:
     text = path.read_text(encoding="utf-8")
     lines = _unfold_ics_lines(text)
 
@@ -181,14 +187,25 @@ def _load_ics(path: Path) -> List[Event]:
         if rrule_item:
             rrule_val = rrule_item[1] if isinstance(rrule_item, tuple) else rrule_item
             try:
-                from .rrule import RRule, expand_rrule
+                from .rrule import RRule, expand_rrule, RRuleHorizonError
                 rule = RRule.parse(rrule_val)
                 exdates = _collect_exdates(
                     raw, base_ev.start.tzinfo, calendar_tz, tz_cache
                 )
-                expanded = expand_rrule(base_ev, rule, exdates)
+
+                horizon_date: Optional[datetime] = None
+                if rrule_horizon is not None and rule.count is None and rule.until is None:
+                    horizon_date = base_ev.start + rrule_horizon
+
+                expanded = expand_rrule(
+                    base_ev, rule, exdates,
+                    horizon=horizon_date,
+                    event_title=base_ev.title,
+                )
                 events.extend(expanded)
                 continue
+            except RRuleHorizonError:
+                raise
             except Exception:
                 events.append(base_ev)
         else:
