@@ -34,6 +34,7 @@ class RRule:
     interval: int = 1
     byday: List[int] = field(default_factory=list)
     bymonthday: List[int] = field(default_factory=list)
+    bysetpos: List[int] = field(default_factory=list)
     wkst: int = 0
 
     @classmethod
@@ -70,6 +71,11 @@ class RRule:
                 md = md.strip()
                 if re.match(r"^-?\d+$", md):
                     rrule.bymonthday.append(int(md))
+        if "BYSETPOS" in params:
+            for sp in params["BYSETPOS"].split(","):
+                sp = sp.strip()
+                if re.match(r"^-?\d+$", sp):
+                    rrule.bysetpos.append(int(sp))
         if "WKST" in params:
             w = params["WKST"].strip().upper()
             if w in _DAY_ABBR:
@@ -122,6 +128,8 @@ class RRule:
                 return dt.weekday() in self.byday
             return dt.weekday() == start.weekday()
         if self.freq == "MONTHLY":
+            if self.bysetpos and self.byday:
+                return self._matches_bysetpos_monthly(dt)
             if self.bymonthday:
                 for md in self.bymonthday:
                     target = self._resolve_monthday(dt.year, dt.month, md)
@@ -129,7 +137,7 @@ class RRule:
                         return True
                 return False
             if self.byday:
-                return self._matches_byday_in_month(dt)
+                return dt.weekday() in self.byday
             target_day = min(start.day, calendar.monthrange(dt.year, dt.month)[1])
             return dt.day == target_day
         if self.freq == "YEARLY":
@@ -138,20 +146,34 @@ class RRule:
             return (dt.month == start.month) and (dt.day == target_day)
         return False
 
-    def _matches_byday_in_month(self, dt: datetime) -> bool:
+    def _matches_bysetpos_monthly(self, dt: datetime) -> bool:
         if dt.weekday() not in self.byday:
             return False
-        week_index = (dt.day - 1) // 7
-        last_day = calendar.monthrange(dt.year, dt.month)[1]
-        is_last_week = dt.day + 7 > last_day
-        if self.count and self.count > 0:
-            return week_index == (self.count - 1)
-        if self.count and self.count < 0:
-            if self.count == -1:
-                return is_last_week
-            last_week_index = (last_day - 1) // 7
-            return week_index == (last_week_index + self.count + 1)
-        return True
+        target_days = self._collect_bysetpos_days(dt.year, dt.month)
+        return dt.day in target_days
+
+    def _collect_bysetpos_days(self, year: int, month: int) -> List[int]:
+        last_day = calendar.monthrange(year, month)[1]
+        all_matching: List[int] = []
+        for day in range(1, last_day + 1):
+            try:
+                wd = datetime(year, month, day).weekday()
+            except ValueError:
+                continue
+            if wd in self.byday:
+                all_matching.append(day)
+
+        selected: List[int] = []
+        for pos in self.bysetpos:
+            if pos > 0:
+                idx = pos - 1
+                if 0 <= idx < len(all_matching):
+                    selected.append(all_matching[idx])
+            elif pos < 0:
+                idx = len(all_matching) + pos
+                if 0 <= idx < len(all_matching):
+                    selected.append(all_matching[idx])
+        return selected
 
     def _resolve_monthday(
         self, year: int, month: int, md: int
@@ -175,6 +197,8 @@ class RRule:
                 return self._advance_weekly_with_byday(current)
             return current + timedelta(weeks=self.interval)
         if self.freq == "MONTHLY":
+            if self.bysetpos and self.byday:
+                return self._advance_monthly_bysetpos(current)
             if self.bymonthday:
                 return self._advance_monthly_bymonthday(current)
             if self.byday:
@@ -221,6 +245,23 @@ class RRule:
         if next_sorted:
             return next_month.replace(day=next_sorted[0])
         return next_month
+
+    def _advance_monthly_bysetpos(self, current: datetime) -> datetime:
+        target_days = self._collect_bysetpos_days(current.year, current.month)
+        for td in sorted(target_days):
+            if td > current.day:
+                return current.replace(day=td)
+
+        next_base = _add_months(
+            datetime(current.year, current.month, 1,
+                     current.hour, current.minute, current.second,
+                     tzinfo=current.tzinfo),
+            self.interval,
+        )
+        next_days = self._collect_bysetpos_days(next_base.year, next_base.month)
+        if next_days:
+            return next_base.replace(day=next_days[0])
+        return next_base
 
     def _advance_monthly_byday(self, current: datetime) -> datetime:
         return _add_months(current, self.interval)
